@@ -1,7 +1,9 @@
 import random
 import asyncio
-from typing import Optional
-from urllib.parse import urlencode
+import re
+from html import unescape
+from typing import Optional, List, Tuple, Dict
+from urllib.parse import urlencode, urljoin, urlparse, unquote
 
 import astrbot.api.star as star
 from astrbot.api import llm_tool, logger
@@ -22,6 +24,123 @@ try:
 	from bs4 import BeautifulSoup
 except Exception:  # pragma: no cover
 	BeautifulSoup = None
+
+# 全局内存 LRU 缓存，避免对相同的 Google 接地重定向链接重复发起网络探测
+_URL_CACHE: Dict[str, str] = {}
+_TITLE_CACHE: Dict[str, str] = {}
+_MAX_CACHE_SIZE = 1000
+_TITLE_HTML_LIMIT = 65536
+_BROWSER_UA = (
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+	"(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+def _cache_put(cache: Dict[str, str], key: str, value: str) -> None:
+	"""将解析结果存入全局 LRU 缓存"""
+	if len(cache) >= _MAX_CACHE_SIZE:
+		try:
+			cache.pop(next(iter(cache)))
+		except Exception:
+			cache.clear()
+	cache[key] = value
+
+
+def _is_domain_like(title: str) -> bool:
+	t = (title or "").strip().lower().removeprefix("www.")
+	if not t:
+		return True
+	if " " in t:
+		return False
+	return bool(re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", t))
+
+
+def _clean_page_title(title: str) -> str:
+	title = unescape(title or "")
+	title = re.sub(r"\s+", " ", title).strip(" \t\r\n-|•·")
+	parts = re.split(r"\s+[\|\-–—]\s+", title)
+	if len(parts) >= 2 and len(parts[0]) >= 12:
+		title = parts[0].strip()
+	if len(title) > 80:
+		title = title[:80].rstrip() + "…"
+	return title
+
+
+def _title_from_url_slug(url: str) -> str:
+	try:
+		path = unquote(urlparse(url).path or "")
+	except Exception:
+		return ""
+	parts = [p for p in path.split("/") if p]
+	skip = {
+		"index", "news", "article", "articles", "story", "post", "posts",
+		"blog", "en", "en-global", "zh", "pr", "press", "html", "home",
+		"content", "detail", "details", "page",
+	}
+	cand = ""
+	for part in reversed(parts):
+		part = re.sub(r"\.(html?|php|aspx?)$", "", part, flags=re.I)
+		low = part.lower()
+		if low in skip or re.fullmatch(r"\d{4,}", part):
+			continue
+		# 跳过日期/纯编号：08-01、2026-09-08、12345
+		if re.fullmatch(r"\d{1,4}([-_]\d{1,2}){1,3}", low):
+			continue
+		letters = re.sub(r"[^A-Za-z\u4e00-\u9fff]", "", part)
+		if len(letters) < 4:
+			continue
+		if len(part) >= 8 or "-" in part or "_" in part or re.search(r"[\u4e00-\u9fff]", part):
+			cand = part
+			break
+	if not cand:
+		return ""
+	s = re.sub(r"[\-_]+", " ", cand)
+	s = re.sub(r"\s+", " ", s).strip()
+	if re.fullmatch(r"[A-Za-z0-9 .,'’:+]+", s):
+		s = s.title()
+	return s[:80]
+
+
+def _extract_html_title(html: str) -> str:
+	if BeautifulSoup is not None:
+		soup = BeautifulSoup(html, "html.parser")
+		og = soup.find("meta", attrs={"property": "og:title"}) or soup.find(
+			"meta", attrs={"name": "og:title"}
+		)
+		if og and og.get("content"):
+			return str(og.get("content")).strip()
+		tw = soup.find("meta", attrs={"name": "twitter:title"})
+		if tw and tw.get("content"):
+			return str(tw.get("content")).strip()
+		if soup.title and soup.title.string:
+			return str(soup.title.string).strip()
+		h1 = soup.find("h1")
+		if h1:
+			t = h1.get_text(" ", strip=True)
+			if t:
+				return t
+	og = re.search(
+		r'<meta\b[^>]*?(?:property|name)=["\']og:title["\'][^>]*?content=["\']([^"\']+)["\']',
+		html,
+		re.I | re.S,
+	) or re.search(
+		r'<meta\b[^>]*?content=["\']([^"\']+)["\'][^>]*?(?:property|name)=["\']og:title["\']',
+		html,
+		re.I | re.S,
+	)
+	if og:
+		return og.group(1).strip()
+	tw = re.search(
+		r'<meta\b[^>]*?name=["\']twitter:title["\'][^>]*?content=["\']([^"\']+)["\']',
+		html,
+		re.I | re.S,
+	)
+	if tw:
+		return tw.group(1).strip()
+	m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+	if m:
+		return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+	return ""
 
 
 class Main(star.Star):
@@ -73,12 +192,12 @@ class Main(star.Star):
 			temperature=0.2,
 		)
 
+		# 净化提示词：专注生成客观要点摘要，不再要求模型输出参考来源或 URL
+		# 来源将由插件从官方 API 响应结构 candidates[0].grounding_metadata 中结构化提取与还原
 		prompt = (
 			"你是检索聚合助手。请使用 Google Search 工具对下述问题进行检索，"
-			"产出包含：\n"
-			"1) 关键要点的条目式摘要；\n"
-			"2) 参考来源的列表（标题 + URL）。\n"
-			"请避免冗长描述，直接给出结论与可靠来源。\n"
+			"产出包含关键要点的条目式摘要。\n"
+			"请避免冗长描述，直接给出客观准确的结论。\n"
 			"问题：" + query
 		)
 
@@ -89,10 +208,215 @@ class Main(star.Star):
 				config=config,
 			)
 			text = getattr(resp, "text", None) or self._extract_text(resp)
-			return text.strip() if text else "未从检索中获得可用文本结果。"
+			if not text:
+				return "未从检索中获得可用文本结果。"
+			text = text.strip()
+
+			grounding_meta = None
+			candidates = getattr(resp, "candidates", None) or []
+			if candidates:
+				grounding_meta = getattr(candidates[0], "grounding_metadata", None)
+
+			if grounding_meta:
+				raw_sources: List[Tuple[str, str]] = []
+				chunks = getattr(grounding_meta, "grounding_chunks", None) or []
+				for chunk in chunks:
+					web = getattr(chunk, "web", None)
+					if not web:
+						continue
+					uri = getattr(web, "uri", None)
+					if not uri:
+						continue
+					title = getattr(web, "title", None) or getattr(web, "domain", None) or "来源"
+					raw_sources.append((str(title).strip(), uri))
+
+				if raw_sources:
+					should_resolve = bool(self.config.get("resolve_grounding_urls", True))
+					if should_resolve and httpx is not None:
+						resolved_sources = await self._resolve_sources(raw_sources)
+					else:
+						resolved_sources = raw_sources
+
+					deduped_sources: List[Tuple[str, str]] = []
+					seen_urls: set[str] = set()
+					for title, link in resolved_sources:
+						if link in seen_urls:
+							continue
+						seen_urls.add(link)
+						deduped_sources.append((title, link))
+
+					if deduped_sources:
+						deduped_sources = await self._enrich_source_titles(deduped_sources)
+						source_lines = ["", "302重定向链接如下"]
+						for title, link in deduped_sources:
+							source_lines.append(f"[{title}] {link}")
+						text += "\n".join(source_lines)
+
+				if bool(self.config.get("show_search_queries", False)):
+					queries = getattr(grounding_meta, "web_search_queries", None) or []
+					if queries:
+						text += f"\n检索关键词: {', '.join(queries)}"
+
+			return text
 		except Exception as e:
-			logger.error(f"[gemini_search] 调用失败: {e}")
+			logger.error(f"[gemini_search] 调用失败: {e}", exc_info=True)
 			return f"检索失败：{e}"
+
+	async def _resolve_sources(self, raw_sources: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+		"""并发解析多个接地重定向链接"""
+		if not raw_sources:
+			return []
+
+		proxy = (self.config.get("grounding_proxy") or "").strip() or None
+		client_kwargs = {
+			"headers": {
+				"User-Agent": self.config.get("fetch_user_agent", "Mozilla/5.0 AstrBot")
+			},
+			"trust_env": True,
+		}
+		if proxy:
+			client_kwargs["proxy"] = proxy
+
+		try:
+			async with httpx.AsyncClient(**client_kwargs) as client:
+				tasks = [self._resolve_single_redirect(client, uri) for _, uri in raw_sources]
+				resolved_urls = await asyncio.gather(*tasks, return_exceptions=True)
+
+			results: List[Tuple[str, str]] = []
+			for (title, raw_uri), res in zip(raw_sources, resolved_urls):
+				if isinstance(res, Exception) or not res:
+					results.append((title, raw_uri))
+				else:
+					results.append((title, str(res)))
+			return results
+		except Exception as e:
+			logger.warning(f"[gemini_search] 并发解析重定向链接发生异常: {e}，回退使用原始链接")
+			return raw_sources
+
+	async def _resolve_single_redirect(self, client: httpx.AsyncClient, raw_url: str) -> str:
+		"""解析单个 vertexaisearch 链接的目标真实 URL"""
+		if not raw_url.startswith("https://vertexaisearch.cloud.google.com/grounding-api-redirect/"):
+			return raw_url
+
+		if raw_url in _URL_CACHE:
+			return _URL_CACHE[raw_url]
+
+		try:
+			# 不跟随重定向，直接捕获 302/301/303/307/308 的 Location 响应头，单请求超时约 3.5 秒
+			resp = await client.get(raw_url, follow_redirects=False, timeout=3.5)
+			if resp.status_code in (301, 302, 303, 307, 308):
+				location = resp.headers.get("Location")
+				if location:
+					resolved = urljoin(raw_url, location)
+					_cache_put(_URL_CACHE, raw_url, resolved)
+					return resolved
+		except Exception as e:
+			logger.debug(f"[gemini_search] 解析重定向链接失败 ({raw_url[:60]}...): {e}")
+
+		# 失败优雅降级，退回原始 redirect URL
+		return raw_url
+
+	def _httpx_client_kwargs(self, extra_headers: Optional[dict] = None) -> dict:
+		proxy = (self.config.get("grounding_proxy") or "").strip() or None
+		headers = {
+			"User-Agent": self.config.get("fetch_user_agent", "Mozilla/5.0 AstrBot")
+		}
+		if extra_headers:
+			headers.update(extra_headers)
+		kwargs = {"headers": headers, "trust_env": True}
+		if proxy:
+			kwargs["proxy"] = proxy
+		return kwargs
+
+	async def _enrich_source_titles(
+		self, sources: List[Tuple[str, str]]
+	) -> List[Tuple[str, str]]:
+		"""把域名占位标题换成文章标题；抓取失败时退回 URL 路径名。"""
+		if not sources or httpx is None:
+			return sources
+
+		need_fetch: List[int] = []
+		prepared: List[Tuple[str, str]] = []
+		for idx, (title, url) in enumerate(sources):
+			cached = _TITLE_CACHE.get(url)
+			if cached:
+				prepared.append((cached, url))
+				continue
+			slug = _title_from_url_slug(url)
+			fallback = slug or title
+			if (
+				url.startswith("https://vertexaisearch.cloud.google.com/")
+				or not url.startswith(("http://", "https://"))
+				or not _is_domain_like(title)
+			):
+				final_title = title if not _is_domain_like(title) else fallback
+				prepared.append((final_title, url))
+				if not _is_domain_like(final_title):
+					_cache_put(_TITLE_CACHE, url, final_title)
+				continue
+			prepared.append((fallback, url))
+			need_fetch.append(idx)
+
+		if not need_fetch:
+			return prepared
+
+		try:
+			async with httpx.AsyncClient(
+				**self._httpx_client_kwargs(
+					{
+						"User-Agent": _BROWSER_UA,
+						"Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+						"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+					}
+				)
+			) as client:
+				tasks = [
+					self._fetch_page_title(client, prepared[i][1], prepared[i][0])
+					for i in need_fetch
+				]
+				titles = await asyncio.gather(*tasks, return_exceptions=True)
+			for i, res in zip(need_fetch, titles):
+				fallback = prepared[i][0]
+				url = prepared[i][1]
+				if isinstance(res, Exception) or not res:
+					title = fallback
+				else:
+					title = str(res)
+				prepared[i] = (title, url)
+				if title:
+					_cache_put(_TITLE_CACHE, url, title)
+		except Exception as e:
+			logger.debug(f"[gemini_search] 抓取文章标题失败: {e}")
+		return prepared
+
+	async def _fetch_page_title(
+		self, client: "httpx.AsyncClient", url: str, fallback: str
+	) -> str:
+		try:
+			async with client.stream(
+				"GET", url, follow_redirects=True, timeout=4.0
+			) as resp:
+				if resp.status_code >= 400:
+					return fallback
+				ctype = (resp.headers.get("content-type") or "").lower()
+				if ctype and ("html" not in ctype) and ("xml" not in ctype) and ("text/" not in ctype):
+					return fallback
+				buf = bytearray()
+				async for chunk in resp.aiter_bytes():
+					buf.extend(chunk)
+					if len(buf) >= _TITLE_HTML_LIMIT:
+						break
+			charset = "utf-8"
+			m = re.search(r"charset=([\w-]+)", ctype or "", re.I)
+			if m:
+				charset = m.group(1)
+			html = bytes(buf).decode(charset, errors="replace")
+			title = _clean_page_title(_extract_html_title(html))
+			if title and not _is_domain_like(title):
+				return title
+		except Exception as e:
+			logger.debug(f"[gemini_search] 读取页面标题失败 ({url[:80]}): {e}")
+		return fallback
 
 	@llm_tool("web_fetch")
 	async def web_fetch(self, event: AstrMessageEvent, url: str) -> str:
@@ -392,6 +716,3 @@ class Main(star.Star):
 			return "\n".join(parts) if parts else None
 		except Exception:
 			return None
-
-
-

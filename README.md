@@ -20,7 +20,7 @@ _✨ [astrbot](https://github.com/AstrBotDevs/AstrBot) 一个调用 Gemini 格�
 
 ## 功能特性
 - 原生 Google Search 工具接入：无需自建爬虫，检索能力由 Gemini 托管
-- 结果结构化：要点式摘要 + 参考来源列表（标题 + URL）
+- 结果结构化：要点式摘要 + 权威参考来源列表（标题 + 真实 URL，通过 grounding_metadata 结构化提取并经异步并发 302 探测还原为目标网站直链，告别模型 Token 损坏与伪造 URL）
 - 多 API Key 负载分摊：支持随机或轮询挑选 Key
 - 可配置的失败重试：开关、次数、时间间隔，稳中求稳
 - 即插即用：作为 LLM 函数工具自动启用（名称：`gemini_search`）
@@ -79,6 +79,11 @@ git clone https://github.com/Chris95743/astrbot_plugin_gemini_search
 - retry_interval_seconds（float）
 	- 两次调用之间的等待秒数（默认 2.0）
 
+新增：接地来源直链解析与检索建议
+- resolve_grounding_urls（bool）是否将搜索接地返回的重定向链接解析还原为真实原始 URL，默认 true
+- grounding_proxy（string）解析接地重定向链接所用的代理地址（可选，留空则走环境变量 HTTP(S)_PROXY）
+- show_search_queries（bool）是否在搜索结果末尾附带 Google 检索关键词，默认 false
+
 新增：截图与抓取相关
 - screenshot_api_base（string）默认 `https://screenshotsnap.com/api/screenshot`
 - screenshot_format（string）`webp|png`，默认 `webp`
@@ -99,8 +104,10 @@ git clone https://github.com/Chris95743/astrbot_plugin_gemini_search
 1) 插件注册 `@llm_tool("gemini_search")` 函数工具，并在插件初始化时激活
 2) 当对话需要实时检索时，Agent 调用该工具
 3) 工具通过 Google GenAI SDK 调用 Gemini 2.0 Flash，并启用原生 `GoogleSearch` 工具进行检索
-4) 模型返回要点摘要与来源列表；插件将文本作为工具结果注入会话
-5) 主模型据此继续组织最终回答（AstrBot 的标准 Tool-Loop 流程）
+4) 模型生成要点摘要；插件从官方响应 candidates[0].grounding_metadata 提取结构化引用来源
+5) 对 Google 加密重定向链接进行异步并发 302 探测与内存 LRU 缓存，还原为永久真实的网页直链并去重
+6) 插件拼装标准参考来源列表并注入会话
+7) 主模型据此继续组织最终回答（AstrBot 的标准 Tool-Loop 流程）
 
 ## 使用示例（对话思路）
 - 用户：今年某领域的最新进展？给出要点摘要并附参考链接

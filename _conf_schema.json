@@ -83,5 +83,23 @@
         "type": "bool",
         "hint": "开启使用插件内Gemini分析截图后返回文字结果; 关闭则将截图注入到主模型上下文，由主模型直接分析图片",
         "default": true
+    },
+    "resolve_grounding_urls": {
+        "description": "是否将搜索接地返回的重定向链接解析还原为真实原始URL",
+        "type": "bool",
+        "hint": "开启后将通过异步并发探测302重定向，把Google加密重定向链接还原为目标网页真实直链",
+        "default": true
+    },
+    "grounding_proxy": {
+        "description": "解析接地重定向链接所用的代理地址",
+        "type": "string",
+        "hint": "可选 HTTP/SOCKS 代理地址，例如 http://127.0.0.1:7890。若留空则自动继承系统环境变量 HTTP(S)_PROXY",
+        "default": ""
+    },
+    "show_search_queries": {
+        "description": "是否在搜索结果末尾附带 Google 检索关键词",
+        "type": "bool",
+        "hint": "开启后将在参考来源末尾显示模型实际触发的搜索检索词 (web_search_queries)",
+        "default": false
     }
 }
